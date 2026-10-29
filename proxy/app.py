@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import (JSONResponse, RedirectResponse,
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                StreamingResponse)
 
 import features

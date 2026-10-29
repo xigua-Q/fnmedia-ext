@@ -51,3 +51,10 @@ dist/
 # 论坛发布草稿（本地，不入库）
 /FORUM_POST*.md
 /FORUM_RELEASE_*.md
+
+# 第三方网盘（夸克等）扫码登录/转存/直链，私有
+/proxy/pan.py
+/state/pan_*.json
+
+# 网盘功能内联第三方库(随pan私有)
+/proxy/_vendor/
