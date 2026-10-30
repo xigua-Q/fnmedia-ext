@@ -3837,7 +3837,16 @@ async def ext_import_subscription(request: Request):
         enable_guard = "smart"
 
     try:
-        if body.get("url"):
+        if body.get("builtin"):
+            # 内置推荐订阅（如一键导入饭太硬）：在 tvbox 内完成多镜像尝试与解密。
+            _builtin = str(body["builtin"]).strip().lower()
+            if _builtin == "fantaiying":
+                raw_sites, _spider, _base, _used = await tvboxmod.load_fantaiying()
+                _subs, _rules = 0, []
+            else:
+                return JSONResponse({"code": 400, "msg": f"未知内置订阅：{_builtin}"},
+                                    status_code=400)
+        elif body.get("url"):
             raw_sites, _subs, _spider, _base, _rules = await tvboxmod.load_subscription_full(
                 url=str(body["url"]).strip())
         elif body.get("text"):

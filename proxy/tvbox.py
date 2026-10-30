@@ -37,6 +37,29 @@ _PAN_HINT = re.compile(r"(quark|uc\.cn|aliyundrive|alipan|115|baidupcs|pan\.baid
                        r"weiyun|xunlei|cloud189|ctfile|c189)", re.I)
 _SPIDER_PREFIX = ("csp_", "csp_App", "py_", "java_", "sp_")
 
+# 内置「饭太硬」TVBox 订阅（一键默认导入）。官方 .cc/tv 是落地页，真正维护的
+# 配置是 GitHub 上的 FongMi 加密 XC.json（整段 hex + $#671#$ AES，见 _fongmi_decrypt）。
+# github raw 直连受限，按顺序尝试官方与多个国内加速镜像，任一取到即停。
+FONGMI_FANTAIYING = {
+    "id": "fantaiying",
+    "name": "饭太硬（内置·在线+网盘聚合）",
+    # 上游相对路径（解析子订阅/全局 spider jar 时作 base）
+    "base": "https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json",
+    "mirrors": [
+        "https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json",
+        "https://ghfast.top/https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json",
+        "https://gh-proxy.com/https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json",
+        "https://ghproxy.net/https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json",
+        "https://cdn.jsdelivr.net/gh/yoursmile66/TVBox@main/XC.json",
+    ],
+}
+
+
+def fantaiying_urls() -> list[str]:
+    """内置饭太硬订阅的候选 URL（官方 + 镜像），按优先级返回。"""
+    return list(FONGMI_FANTAIYING["mirrors"])
+
+
 
 def _b64_try(text: str) -> str | None:
     t = text.strip()
@@ -146,8 +169,62 @@ def _image_embedded_text(data: bytes) -> str | None:
     return None
 
 
+def _fongmi_decrypt(text: str) -> str | None:
+    """解密 FongMi/OK影视 系「加密订阅」（饭太硬 XC.json 即用此格式）。
+
+    形态：整段为十六进制；hex 解码后以 ``$#<code>#$`` 开头（如 ``$#671#$/``），
+    其后是 AES-128-CBC 密文。密钥/IV 不单独下发，而是内嵌：
+      - key = ``$#`` 与 ``#$`` 之间的字符串（如 ``671``），右补 ``0`` 到 16 字节；
+      - IV  = 明文（hex 串）末 13 个字符，右补 ``0`` 到 16 字节；
+      - 密文 = 原始 hex 串中 ``2324`` 标记之后、末 26 个 hex 字符之前的部分。
+    解密结果通常是版权/警告注释 + 真正 JSON，从第一个 ``{`` 起解析。
+    与开源 @whyun/tv-tools 的 decodeTvboxJson 行为一致。
+    """
+    try:
+        s = (text or "").strip()
+        if len(s) < 64 or not re.fullmatch(r"[0-9a-fA-F]+", s):
+            return None
+        blob = bytes.fromhex(s).decode("utf-8", "ignore").lower()
+        if "$#" not in blob or "#$" not in blob:
+            return None
+        mark = s.find("2324")
+        if mark < 0:
+            return None
+
+        def _pad16(v: str) -> bytes:
+            v = (v or "").strip()[:16]
+            return (v + "0" * (16 - len(v))).encode("utf-8")
+
+        key = _pad16(blob[blob.find("$#") + 2: blob.find("#$")])
+        iv = _pad16(blob[-13:])
+        ct = bytes.fromhex(s[mark + 4: len(s) - 26])
+        if not ct:
+            return None
+        pt: bytes | None = None
+        try:  # 优先 cryptography（venv 内置）
+            from cryptography.hazmat.primitives.ciphers import (
+                Cipher, algorithms, modes)
+            from cryptography.hazmat.primitives import padding as _pad
+            dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+            raw = dec.update(ct) + dec.finalize()
+            unp = _pad.PKCS7(128).unpadder()
+            pt = unp.update(raw) + unp.finalize()
+        except Exception:
+            try:  # 兜底：pycryptodome
+                from Crypto.Cipher import AES  # type: ignore
+                from Crypto.Util.Padding import unpad as _unpad  # type: ignore
+                pt = _unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(ct), 16)
+            except Exception:
+                return None
+        out = pt.decode("utf-8", "replace")
+        return out if ('"' in out) else None
+    except Exception:
+        return None
+
+
 def parse_config_text(text: str) -> dict | None:
-    """把文本解析成配置 dict；支持裸 JSON、JSONC(//注释) 与 base64 包裹。"""
+    """把文本解析成配置 dict；支持裸 JSON、JSONC(//注释)、base64 包裹、
+    以及 FongMi 加密订阅（hex + AES-128-CBC）。"""
     text = (text or "").strip()
     if not text:
         return None
@@ -157,6 +234,17 @@ def parse_config_text(text: str) -> dict | None:
     decoded = _b64_try(text)
     if decoded:
         cfg = _json_loads_dict(decoded)
+        if cfg is not None:
+            return cfg
+    # FongMi 加密订阅（hex 密文）
+    dec = _fongmi_decrypt(text)
+    if dec:
+        i = dec.find("{")
+        if i >= 0:
+            cfg = _json_loads_dict(dec[i:])
+            if cfg is not None:
+                return cfg
+        cfg = _json_loads_dict(dec)
         if cfg is not None:
             return cfg
     return None
@@ -311,6 +399,27 @@ def is_drpy_site(site: dict) -> bool:
         ".js" in low or "dr_py" in low or "drpy" in low)
 
 
+# 依赖 ARM 原生库（加固 so 经 ndk_translation 反调试自检会 SIGABRT）的
+# FongMi/Yoursmile 爬虫类：在 x86_64 redroid 上一调用即杀进程，必须在导入/调度前
+# 屏蔽，避免打崩整个 bridge（连累其它正常源）。依据是 jar 内 native so 的 JNI 导出
+# 符号 + dex 继承闭包（en.NetPan/en.BaseApi 派生族）。网盘类尤其在此。
+_FONGMI_NATIVE_CLASSES = {
+    # libstub 直接导出 native 方法的类
+    "Wogg", "kongbai", "Jpys", "GuanYing",
+    "TgYunDouBanPan", "TgYunPanLocal",
+    # en.NetPan / en.BaseApi 派生族（dex 继承闭包，含网盘与网盘聚合）
+    "Bili", "ConfigCenter", "Douyu", "Emby", "FourKZN", "GuaZi",
+    "HuaJuan", "Huya", "Ikanbot", "PanSearch", "PanSou", "PanSouFish",
+    "PanSouQuark", "PanTa", "Push", "Qiwei", "SeedHub", "Star2",
+    "WoNiu", "Youtube", "光鸭社区", "网盘集合",
+}
+
+
+def _is_fongmi_native_class(cls: str) -> bool:
+    """去 csp_ 前缀后的类名是否命中饭太硬 native 崩溃黑名单。"""
+    return (cls or "").strip() in _FONGMI_NATIVE_CLASSES
+
+
 def classify_subscription(sites: list[dict], spider: str = "",
                           base: str = "") -> dict:
     """把一份订阅的原始 sites 一次分成五类。
@@ -379,25 +488,32 @@ def classify_subscription(sites: list[dict], spider: str = "",
         if t == "3" or api.startswith(_SPIDER_PREFIX) or "csp_" in api.lower():
             low = api.lower()
             if api.startswith("csp_") and not api.endswith("Guard"):
-                # 普通纯 dex 爬虫：类名即 csp_Xxx，由订阅全局 spider jar 承载。
-                # 同一个 Spider 类可被多个站点以不同 ext 复用（如 csp_XBPQ），
-                # 唯一性按 (类, ext) 判定；同类多配置追加序号，等同 guard 规则。
+                base_key = api[4:]                    # 去 csp_ 前缀
+                # 饭太硬加固族（Yoursmile/libstub 与伪装 PNG jar 的 *Amns）在 x86_64
+                # redroid + ndk_translation 下一调用即 SIGABRT 杀进程，导入前直接屏蔽，
+                # 避免打崩 bridge 连累其它源。网盘类基本都落在这里。
+                if base_key.endswith("Amns") or _is_fongmi_native_class(base_key):
+                    _skip(name, "加固原生源（x86 模拟器会崩溃，已屏蔽）")
+                    continue
+                # 普通纯 dex 爬虫：类名即 csp_Xxx，由订阅全局 spider jar 或站点自带 jar
+                # 承载。同一个 Spider 类可被多个站点以不同 ext 复用（如 csp_XBPQ），
+                # 唯一性按 (类, ext, jar) 判定；同类多配置追加序号，等同 guard 规则。
                 ext = s.get("ext")
                 ext_str = ext if isinstance(ext, str) else (
                     "" if ext is None else json.dumps(ext, ensure_ascii=False))
-                sig = (api.lower(), ext_str.strip().lower())
+                site_jar = str(s.get("_site_jar") or s.get("_spider_jar") or "").strip() \
+                    or jar_url
+                sig = (api.lower(), ext_str.strip().lower(), site_jar)
                 if sig in seen_csp:
                     continue
                 seen_csp.add(sig)
-                site_jar = str(s.get("_spider_jar") or "").strip() or jar_url
-                base_key = api[4:]                    # 去 csp_ 前缀
                 count[base_key] = count.get(base_key, 0) + 1
                 uniq = base_key if count[base_key] == 1 else f"{base_key}{count[base_key]}"
                 csp.append({
                     "key": uniq,
                     "spider": api,
                     "name": name or api,
-                    "cls": "com.github.catvod.spider." + api[4:],
+                    "cls": "com.github.catvod.spider." + base_key,
                     "ext": ext_str,
                     "jar": site_jar,
                     "searchable": s.get("searchable", 1),
@@ -470,8 +586,18 @@ async def load_subscription_full(url: str | None = None,
         sub_base = u or ""
         sub_jar = _spider_jar_url(sub_spider, sub_base)
         for st in extract_sites(cfg):
-            if sub_jar and isinstance(st, dict) and not st.get("_spider_jar"):
-                st["_spider_jar"] = sub_jar
+            if isinstance(st, dict):
+                if sub_jar and not st.get("_spider_jar"):
+                    st["_spider_jar"] = sub_jar
+                # 站点自带 jar（饭太硬部分源用伪装成 PNG 的独立 jar），优先级高于全局。
+                # 形如 "https://h/p.png;md5;xxxx"，去掉 ;md5; 后缀并补全相对地址。
+                sj = st.get("jar")
+                if isinstance(sj, str) and sj.strip():
+                    sj_url = sj.strip().split(";", 1)[0].strip()
+                    if sj_url and "://" not in sj_url and sub_base:
+                        sj_url = urljoin(sub_base.rstrip("/") + "/", sj_url.lstrip("/"))
+                    if sj_url:
+                        st["_site_jar"] = sj_url
             all_sites.append(st)
         if depth < MAX_DEPTH:
             base = u or ""
@@ -488,3 +614,20 @@ async def load_subscription(url: str | None = None,
     sites, subs, spider, base, _rules = await load_subscription_full(url=url,
                                                                      text=text)
     return sites, subs, spider, base
+
+
+async def load_fantaiying():
+    """加载内置「饭太硬」订阅：按官方 + 镜像顺序尝试，首个成功即用。
+
+    返回 (sites, spider, base, used_url)；全部失败抛最后一个异常。
+    """
+    last: Exception | None = None
+    for u in fantaiying_urls():
+        try:
+            sites, _subs, spider, base, _rules = await load_subscription_full(url=u)
+            if sites:
+                return sites, spider, base, u
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise RuntimeError(f"内置饭太硬订阅所有镜像均不可达：{last}")
+

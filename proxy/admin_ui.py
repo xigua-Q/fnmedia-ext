@@ -384,7 +384,8 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           能直接播放的<strong>自动启用</strong>；P2P/磁力/云盘等慢源与 jar/脚本暂未就绪的源导入后默认关闭，可在结果里开启或补传；
           网盘/直播/无法识别的源跳过并说明原因。</p>
         <div class="row"><input type="text" id="subUrl" placeholder="配置订阅 URL（支持 base64 与多订阅聚合）" style="flex:2"/>
-          <button class="primary small" onclick="importSubscription('url')">按 URL 导入</button></div>
+          <button class="primary small" onclick="importSubscription('url')">按 URL 导入</button>
+        </div>
         <label class="field"><textarea id="subText" rows="7" placeholder="或直接粘贴配置 JSON（含 sites 数组）…"></textarea></label>
         <div class="btn-row">
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
@@ -1096,6 +1097,22 @@ async function subToggleGuard(key,on){
     if(r.code===0){toast(on?"已启用":"已停用");try{await loadStatus();}catch(e){}}
     else toast(r.msg||"操作失败","fail");
   }catch(e){toast(String(e),"fail");}
+}
+async function importFantaiying(){
+  const out=$("subResult");
+  out.innerHTML='<div class="muted sm">正在拉取内置「饭太硬」官方订阅（多镜像自动切换、自动解密），请稍候…</div>';
+  try{
+    const r=await jpost("/v/api/ext/source/import-subscription",
+      {builtin:"fantaiying",standalone:$("subStandalone").checked,enable_guard:"smart"});
+    if(r.code!==0){out.innerHTML='<div class="hint" style="color:var(--danger)">导入失败：'+esc(r.msg||"")+'</div>';return;}
+    renderSubResult(r.data||{});
+    toast("饭太硬导入完成");
+    try{loadAdfilter();}catch(e){}
+    try{await loadStatus();}catch(e){}
+    try{await loadGuard();}catch(e){}
+    try{await loadSpiderMgmt();}catch(e){}
+    try{await loadDrpyMgmt();}catch(e){}
+  }catch(e){out.innerHTML='<div class="hint" style="color:var(--danger)">导入出错：'+esc(String(e))+'</div>';}
 }
 function goDeploy(){switchPage("tvbox");setTimeout(()=>{const b=$("scInstallAll");if(b)b.click();},80);}
 function renderSubResult(d){
