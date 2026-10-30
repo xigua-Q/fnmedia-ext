@@ -53,7 +53,17 @@ from store import (store, make_guid, media_guid, video_guid, is_online_guid,
 
 UPSTREAM_SOCK = os.environ.get("FNMEDIA_UPSTREAM_SOCK",
                                "/var/run/trim_media_upstream.sock")
+# 本服务回环基址：网盘原画/转码播放地址是根相对路径，HLS 探测/改写需经本机
+# HTTP 自调用（nginx 5666 → 本应用），不能直接喂给外站 client。
+SELF_BASE = os.environ.get("FNM_SELF_BASE", "http://127.0.0.1:5666")
 ONLINE_PREFIX = "/v/media/online"
+
+
+def _self_url(url: str) -> str:
+    """把本服务根相对地址绝对化为回环地址；外站绝对地址原样返回。"""
+    if url.startswith("/"):
+        return SELF_BASE.rstrip("/") + url
+    return url
 _search_cache: dict[str, tuple[float, list]] = {}
 _search_inflight: dict[str, asyncio.Future] = {}
 CACHE_TTL = 120
@@ -2261,6 +2271,8 @@ async def direct_proxy(mg: str, request: Request):
                                     "index": target.get("index", 0)})
         return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}",
                                 status_code=302)
+    # 网盘原画直出 mp4：src 是本服务根相对地址，经回环自调用（注入网盘 Cookie）
+    src_url = _self_url(src_url)
     fwd = dict(target.get("headers") or {})
     if request.headers.get("range"):
         fwd["Range"] = request.headers["range"]
@@ -2602,15 +2614,21 @@ async def _probe_latency(cand: dict, request: Request,
     t0 = time.time()
     try:
         await _resolve_if_needed(cand, request)
-        url = cand.get("url", "")
-        if not url or not url.startswith("http"):
+        raw_url = cand.get("url", "")
+        if not raw_url:
             return None
+        # 网盘转存后是本服务根相对地址（/v/api/ext/pan/play?fid=…），经回环自调用
+        url = _self_url(raw_url)
         headers = cand.get("headers") or {"User-Agent": "Mozilla/5.0"}
         cli = ext_client(request)
 
         # 非 HLS（网盘 /d 直链、mp4 等）：Range GET 探测
-        is_m3u8 = bool(re.search(r"\.m3u8(\?|$)", url.split("?", 1)[0], re.I))
-        if not is_m3u8:
+        is_m3u8 = bool(cand.get("m3u8")) or bool(
+            re.search(r"\.m3u8(\?|$)", url.split("?", 1)[0], re.I))
+        # 网盘播放代理按 fid 实时换链：转码档返回清单、原画直出 mp4，URL 无后缀，
+        # 直接交给播放列表构建（build_hls）或轻量抓清单判定，避免误走 Range 探测。
+        is_pan_proxy = "/v/api/ext/pan/" in url
+        if not is_m3u8 and not is_pan_proxy:
             try:
                 req = cli.build_request(
                     "GET", url, headers={**headers, "Range": _PROBE_RANGE})
@@ -2868,12 +2886,16 @@ async def _build_playlist_body(mg: str, picked: dict, request: Request):
     headers = picked["headers"]
     was_redirect = bool(picked.get("redirect"))
     await _resolve_if_needed(picked, request)
-    src_url = picked["url"]
+    src_url = _self_url(picked["url"])
     # 解析后若发现其实是 mp4 直链（wrapper 预判为 HLS 时的兜底），交由调用方 302
     if not re.search(r"\.m3u8(\?|$)", src_url, re.I) \
             and re.search(r"\.mp4(\?|$)", src_url, re.I):
         return _NOT_HLS, None
     text, cur = await _fetch_playlist(request, src_url, headers)
+    # 网盘播放代理：原画直出 mp4 时回包不是清单（content-type video、二进制），
+    # 判为非 HLS 交调用方 302 到 direct；转码档则返回正常清单。
+    if text is not None and picked.get("pan") and not _is_media_playlist(text):
+        return _NOT_HLS, None
     # 跳转型源站极慢且间歇抖动：解析后的真实地址抓取失败时，对原始跳转地址
     # 强制重新解析一次再抓，避免整列表 502。
     if text is None and was_redirect:
@@ -3136,8 +3158,11 @@ def _first_variant(text: str, base: str) -> str | None:
 
 
 async def _fetch_playlist(request: Request, url: str, headers: dict,
-                          tries: int = 3):
+                          tries: int = 3, timeout: float = 15.0):
     """抓取并跟随嵌套 master，返回最终媒体列表文本与其基准 URL。失败返回 (None,url)。"""
+    # 网盘播放代理首次需转存+实时换链，给更宽裕的超时
+    if "/v/api/ext/pan/" in url and timeout <= 15.0:
+        timeout = 45.0
     cur, text = url, None
     for _ in range(4):
         try:

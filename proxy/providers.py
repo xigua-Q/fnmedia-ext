@@ -36,6 +36,9 @@ DEFAULT_SOURCES: list[dict] = [
 HTTP_TIMEOUT = 12.0
 _DIRECT_RE = re.compile(r"^https?://", re.I)
 _MEDIA_RE = re.compile(r"\.(m3u8|mp4|flv|mkv|ts)(\?|$)", re.I)
+# 可由自有账号转存原画播放的网盘分享链接（夸克 / UC）。
+_PAN_SHARE_RE = re.compile(
+    r"https?://(?:pan\.quark\.cn/s/|(?:pan|drive)\.uc\.cn/s/)[A-Za-z0-9]+", re.I)
 
 
 @dataclass
