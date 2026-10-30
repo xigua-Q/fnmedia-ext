@@ -2872,6 +2872,36 @@ _PLAYLIST_TTL = 120.0
 # 单飞：同一「集+线路」只允许一次在途抓取，预热与真正取 main 共用同一个 Future
 _PLAYLIST_FUT: dict[str, asyncio.Future] = {}
 
+# 紧凑分片注册表：夸克/UC 转码 HLS 的签名分片 URL 极长（~600 字符，base64 后近千），
+# 一部 90 分钟的片子上千分片会撑出 1MB+ 的清单，且每个分片 URL 超长，经外网网关
+# （Lucky/nginx/fngateway）容易被长度/缓冲限制拦掉，播放器拿到清单却拉不到分片。
+# 故把「清单ID + 序号 → 真实分片URL」留在服务端，清单里只给短 URL（~60 字符）。
+_HLS_REG: dict[str, tuple[float, list[str]]] = {}
+_HLS_REG_TTL = 3 * 3600.0
+_HLS_LONG_URL = 320          # 分片 URL 超过该长度即走紧凑注册表
+_HLS_REG_MAX = 4000
+
+
+def _hls_reg_put(urls: list[str]) -> str:
+    import secrets
+    rid = secrets.token_hex(6)
+    _HLS_REG[rid] = (time.time(), urls)
+    if len(_HLS_REG) > _HLS_REG_MAX:
+        for old in sorted(_HLS_REG, key=lambda k: _HLS_REG[k][0])[:len(_HLS_REG) - _HLS_REG_MAX]:
+            _HLS_REG.pop(old, None)
+    return rid
+
+
+def _hls_reg_get(rid: str, i: int) -> str:
+    ent = _HLS_REG.get(rid)
+    if not ent:
+        return ""
+    ts, urls = ent
+    if time.time() - ts > _HLS_REG_TTL:
+        _HLS_REG.pop(rid, None)
+        return ""
+    return urls[i] if 0 <= i < len(urls) else ""
+
 # 哨兵：该线路解析后实为 mp4 直链（非 HLS），调用方应 302 到 direct
 _NOT_HLS = object()
 
@@ -2958,39 +2988,59 @@ async def _build_playlist_body(mg: str, picked: dict, request: Request):
     seg_index = 0
     out_lines = []
 
+    # 先收集所有分片绝对地址（与下方输出顺序一致：URI 标签按出现序，分片行按出现序）
+    seg_urls: list[str] = []
+    for raw0 in text.splitlines():
+        ln0 = raw0.strip()
+        if ln0.startswith("#"):
+            if ln0.startswith("#EXT-X-MAP") or ln0.startswith("#EXT-X-KEY"):
+                m0 = re.search(r'URI="([^"]+)"', ln0, re.I)
+                if m0:
+                    seg_urls.append(urllib.parse.urljoin(cur, m0.group(1)))
+        elif ln0:
+            seg_urls.append(urllib.parse.urljoin(cur, ln0))
+    # 任一地址过长即整表走紧凑注册表（同表统一，避免混用）
+    use_compact = any(len(u) > _HLS_LONG_URL for u in seg_urls)
+    compact_rid = _hls_reg_put(seg_urls) if use_compact else ""
+
     def seg_decrypt_qs() -> str:
         iv = explicit_iv if explicit_iv is not None else (
             (media_seq + seg_index).to_bytes(16, "big"))
         return f"dec=1&k={b64e(decrypt_key.hex())}&iv={b64e(iv.hex())}"
 
+    compact_i = 0
     for raw in text.splitlines():
         line = raw.strip()
         if line.startswith("#EXT-X-KEY") and decrypt_key is not None:
             # 服务端已解密：客户端无需也不能再拿到密钥标签
             continue
-        if line.startswith("#EXT-X-MAP") and decrypt_key is not None:
-            def repl_map(m):
-                uri = m.group(1)
-                absu = urllib.parse.urljoin(cur, uri)
-                return f'URI="{_seg_url(mg, absu, sel_qs)}"'
-            raw = re.sub(r'URI="([^"]+)"', repl_map, raw)
-            out_lines.append(raw)
-        elif line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-MAP"):
+        if line.startswith("#EXT-X-MAP") or \
+                (line.startswith("#EXT-X-KEY") and 'URI="' in line):
             def repl(m):
+                nonlocal compact_i
                 uri = m.group(1)
-                absu = urllib.parse.urljoin(cur, uri)
-                return f'URI="{_seg_url(mg, absu, sel_qs)}"'
-            raw = re.sub(r'URI="([^"]+)"', repl, raw)
+                if compact_rid:
+                    ref = f"hls?r={compact_rid}&i={compact_i}"
+                else:
+                    ref = _seg_url(mg, urllib.parse.urljoin(cur, uri), sel_qs)
+                compact_i += 1
+                return f'URI="{ref}"'
+            raw = re.sub(r'URI="([^"]+)"', repl, line, flags=re.I)
             out_lines.append(raw)
         elif line.startswith("#") or not line:
             out_lines.append(raw)
         else:
-            if decrypt_key is not None:
-                parts = [p for p in (sel_qs, seg_decrypt_qs()) if p]
-                extra = "&".join(parts)
+            if compact_rid:
+                out_lines.append(
+                    f"hls?r={compact_rid}&i={compact_i}")
+                compact_i += 1
             else:
-                extra = sel_qs
-            out_lines.append(_seg_url(mg, urllib.parse.urljoin(cur, line), extra))
+                if decrypt_key is not None:
+                    parts = [p for p in (sel_qs, seg_decrypt_qs()) if p]
+                    extra = "&".join(parts)
+                else:
+                    extra = sel_qs
+                out_lines.append(_seg_url(mg, urllib.parse.urljoin(cur, line), extra))
             seg_index += 1
     return "\n".join(out_lines) + "\n", cur
 
@@ -3315,6 +3365,44 @@ async def hls_seg(mg: str, request: Request):
         _log.warning("seg upstream %s %s", r.status_code,
                      urllib.parse.urlsplit(src_url).netloc)
     return Response(content=body, status_code=decrypt_resp_status, headers=h)
+
+
+@app.get(f"{ONLINE_PREFIX}/{{mg}}/hls")
+async def hls_compact(mg: str, request: Request):
+    """紧凑分片：清单只带 r=<注册表ID>&i=<序号>，真实 CDN（夸克/UC 等）地址留
+    在服务端。用于签名分片超长、清单过大的转码 HLS，规避外网网关 URL/体积限制。"""
+    rid = request.query_params.get("r", "")
+    try:
+        idx = int(request.query_params.get("i", "0"))
+    except ValueError:
+        idx = 0
+    src_url = _hls_reg_get(rid, idx)
+    if not src_url:
+        return Response("expired", status_code=410)
+    fwd: dict = {}
+    # 网盘 CDN 分片必须带登录 Cookie（裸取 412），按域名兜底注入
+    if request.headers.get("range"):
+        fwd["Range"] = request.headers["range"]
+    try:
+        r = await ext_get_retry(request, src_url, fwd, tries=4, timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("hls compact seg fail %s", type(exc).__name__)
+        return Response("seg fail", status_code=502)
+    body = r.content
+    ctype = r.headers.get("content-type", "")
+    if body[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            import quality
+            payload, _ = quality._unwrap_segment(body)
+            if payload is not body:
+                body, ctype = payload, "video/mp2t"
+        except Exception:
+            pass
+    h = _safe_response_headers(r.headers, {"content-security-policy"})
+    h["Access-Control-Allow-Origin"] = "*"
+    h["Content-Length"] = str(len(body))
+    h.setdefault("Content-Type", ctype or "video/mp2t")
+    return Response(content=body, status_code=r.status_code, headers=h)
 
 
 # ------------------------------------------------------------- 海报代理
